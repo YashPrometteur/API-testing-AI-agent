@@ -59,6 +59,7 @@ class OpenRouterClient:
                     messages=messages,
                     response_format={"type": "json_object"},
                     temperature=temperature,
+                    max_tokens=1500,
                 )
                 raw_text = response.choices[0].message.content or ""
                 raw_text_clean = raw_text.strip()

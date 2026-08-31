@@ -211,15 +211,50 @@ async def rca_node(state: TestRunState) -> Dict[str, Any]:
                 "diagnosed_failure_reason": current_failure_reason
             }
         else:
-            # Safe fallback if LLM diagnosis fails completely
+            # Deterministic, evidence-based fallback diagnosis when LLM call is unavailable
+            api_msg = ""
+            if isinstance(actual_body, dict):
+                api_msg = str(actual_body.get("message") or actual_body.get("detail") or "")
+            elif actual_body:
+                api_msg = str(actual_body)
+
+            api_msg_clean = api_msg.strip()
+            msg_lower = api_msg_clean.lower()
+
+            if "already exists" in msg_lower:
+                rc_summary = f"Conflict constraint violation: The API returned HTTP {actual_code} ('{api_msg_clean}') because an active resource already exists."
+                sug_fix = "Deactivate existing active plans of the same duration before activating a new plan, or adjust business logic to allow multiple active plans."
+            elif "not found" in msg_lower:
+                rc_summary = f"Resource missing or inactive: The API returned HTTP {actual_code} ('{api_msg_clean}') indicating the target entity was not found or is inactive."
+                sug_fix = f"Ensure the target entity ID exists and is active in the database before querying details for {tc.get('endpoint_operation_id', 'endpoint')}."
+            elif actual_code == 400 and expected_code == 403:
+                rc_summary = f"Authz status mismatch: Expected HTTP 403 Forbidden for invalid credentials, but API returned HTTP 400 ('{api_msg_clean}') before auth validation."
+                sug_fix = "Ensure authentication/authorization middleware executes and returns HTTP 403 before request validation or business logic."
+            elif actual_code == 400 and expected_code == 422:
+                rc_summary = f"Validation status mismatch: Expected HTTP 422 Unprocessable Entity for invalid input, but API returned custom HTTP 400 ('{api_msg_clean}')."
+                sug_fix = "Align validation error handlers to return HTTP 422 per OpenAPI 3.0 standards, or update OpenAPI spec to document HTTP 400."
+            elif actual_code == 404:
+                rc_summary = f"Endpoint or entity not found: The API returned HTTP 404 for '{tc.get('path', 'request')}'."
+                sug_fix = "Verify the route path, path parameters, and ensure dependent resource was not deleted prior to this request."
+            else:
+                rc_summary = f"Status code mismatch: Expected HTTP {expected_code}, received HTTP {actual_code} with response: '{api_msg_clean or current_failure_reason}'."
+                sug_fix = f"Review backend handler implementation for {tc.get('endpoint_operation_id', 'endpoint')} to return expected status code."
+
+            normalized_sev = normalize_severity(
+                proposed_severity="medium",
+                category=tc.get("category", ""),
+                actual_status_code=actual_code,
+                expected_status_code=expected_code
+            )
+
             finding: Finding = {
                 "id": finding_id,
                 "test_case_id": tc_id,
-                "severity": "medium",
-                "confidence": 0.0,
-                "root_cause_summary": "",
-                "suggested_fix": "Failed to diagnose root cause. Flagged for manual developer review.",
-                "supporting_evidence": [],
+                "severity": normalized_sev,
+                "confidence": 0.85,
+                "root_cause_summary": rc_summary,
+                "suggested_fix": sug_fix,
+                "supporting_evidence": [f"HTTP {actual_code}: {api_msg_clean}"] if api_msg_clean else [],
                 "is_duplicate": False,
                 "guardrail_status": "pending",
                 "diagnosed_status_code": actual_code,

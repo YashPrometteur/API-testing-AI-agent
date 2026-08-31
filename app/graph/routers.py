@@ -27,11 +27,13 @@ def fan_out_generators(state: TestRunState) -> List[Send]:
     }
 
     sends = []
+    auth_config = state.get("auth_config", {})
     payload = {
         "run_id": state.get("run_id", ""),
         "endpoints": state.get("endpoints", []),
         "test_plan": state.get("test_plan", {}),
-        "spec_id": state.get("spec_id", "")
+        "spec_id": state.get("spec_id", ""),
+        "auth_config": auth_config
     }
 
     for cat, node_name in category_node_map.items():
@@ -57,6 +59,7 @@ def fan_out_execution_batches(state: TestRunState) -> List[Send]:
     """Fan-out router: Spawns execute_batch node in parallel for each execution batch."""
     batches = state.get("execution_batches", [])
     target_base_url = state.get("target_base_url", "https://petstore.swagger.io/v2")
+    auth_config = state.get("auth_config", {})
 
     sends = []
     run_id = state.get("run_id", "")
@@ -65,7 +68,8 @@ def fan_out_execution_batches(state: TestRunState) -> List[Send]:
             "run_id": run_id,
             "batch_id": batch.get("batch_id", "batch_1"),
             "test_cases": batch.get("test_cases", []),
-            "target_base_url": target_base_url
+            "target_base_url": target_base_url,
+            "auth_config": auth_config
         }
         sends.append(Send("execute_batch", payload))
 

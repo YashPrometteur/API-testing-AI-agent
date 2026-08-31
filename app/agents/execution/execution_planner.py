@@ -24,6 +24,10 @@ def extract_resource_id_dependencies(tc: TestCase) -> set[str]:
     for m in matches:
         refs.add(m)
 
+    # Direct 24-character hexadecimal MongoDB ObjectId in path e.g. /64b8f0e9e5162e84ea981e01
+    if re.search(r"/[0-9a-fA-F]{24}", path) or re.search(r"/(?:valid_plan_id|some_plan_id|12345|123)", path):
+        refs.add("primary_id")
+
     for k in path_params.keys():
         refs.add(k)
 
@@ -38,30 +42,81 @@ def extract_resource_id_dependencies(tc: TestCase) -> set[str]:
     return refs
 
 
-def is_resource_creator(tc: TestCase) -> bool:
-    """Identify if a test case creates a primary resource (e.g., POST request with valid body)."""
+def is_discovery_endpoint(tc: TestCase) -> bool:
+    """Identify if a test case queries resource collections (e.g. GET /plans_list) that discover existing IDs."""
     req = tc.get("request", {})
+    path = req.get("path", "").lower()
+    op_id = tc.get("endpoint_operation_id", "").lower()
     method = req.get("method", "GET").upper()
     cat = tc.get("category", "")
-    return method == "POST" and cat in ("functional", "edge_case")
+    has_id_deps = bool(extract_resource_id_dependencies(tc))
+    
+    # Must be a collection-level GET without resource IDs (e.g. /get_plans_list)
+    is_collection = "list" in path or "list" in op_id or "search" in path or "all" in op_id
+    return method == "GET" and not has_id_deps and is_collection and cat in ("functional", "edge_case")
+
+
+def is_resource_creator(tc: TestCase) -> bool:
+    """Identify if a test case creates a primary resource without requiring existing IDs (e.g. POST /create_subscription)."""
+    req = tc.get("request", {})
+    path = req.get("path", "").lower()
+    op_id = tc.get("endpoint_operation_id", "").lower()
+    method = req.get("method", "GET").upper()
+    cat = tc.get("category", "")
+    has_id_deps = bool(extract_resource_id_dependencies(tc))
+    
+    is_create = ("create" in path or "create" in op_id or "add" in op_id or "new" in path)
+    return method == "POST" and not has_id_deps and (is_create or cat in ("functional", "edge_case"))
+
+
+def is_resource_deleter(tc: TestCase) -> bool:
+    """Identify if a test case deletes/destroys a resource (e.g., DELETE request)."""
+    req = tc.get("request", {})
+    method = req.get("method", "GET").upper()
+    return method == "DELETE"
 
 
 def sort_test_cases_by_dependency(test_cases: List[TestCase]) -> List[TestCase]:
-    """Sort test cases so resource-creating POST requests execute before dependent GET/PUT/DELETE requests."""
+    """Sort test cases: Discoverers -> Creators -> Dependents (Toggle -> Read -> Update) -> Others -> Deleters (DELETE)."""
+    discoverers = []
     creators = []
     dependents = []
+    deleters = []
     others = []
 
     for tc in test_cases:
-        if is_resource_creator(tc):
+        if is_resource_deleter(tc):
+            deleters.append(tc)
+        elif is_discovery_endpoint(tc):
+            discoverers.append(tc)
+        elif is_resource_creator(tc):
             creators.append(tc)
         elif extract_resource_id_dependencies(tc):
             dependents.append(tc)
         else:
             others.append(tc)
 
-    # Topological order: Creators first, then others, then dependents
-    return creators + others + dependents
+    # Sub-sort dependents: Toggles (activate) -> GET details (read) -> PATCH updates (modify)
+    def dependent_sort_key(tc):
+        method = tc.get("request", {}).get("method", "GET").upper()
+        path = tc.get("request", {}).get("path", "").lower()
+        if "toggle" in path or (method == "POST" and "status" in path):
+            return 1  # Activate first
+        elif method == "GET":
+            return 2  # Read active plan second
+        elif method in ("PATCH", "PUT"):
+            return 3  # Update plan third
+        return 4
+
+    dependents.sort(key=dependent_sort_key)
+
+    # Topological order:
+    # 1. Discoverers (GET list)
+    # 2. Creators (POST create)
+    # 3. Dependents (POST toggle -> GET details -> PATCH update)
+    # 4. Others (Authz / standalone edge cases)
+    # 5. Deleters (DELETE)
+    return discoverers + creators + dependents + others + deleters
 
 
 async def execution_planner_node(state: TestRunState) -> Dict[str, Any]:

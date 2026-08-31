@@ -2,6 +2,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import uuid
 
 from app.graph.state import TestCase, TestRunState
 from app.llm import get_llm_client
@@ -71,6 +72,10 @@ async def generate_category_test_cases(
             max_retries=1
         )
 
+        auth_config = state_or_payload.get("auth_config") or {}
+        token = auth_config.get("token") or auth_config.get("key")
+        auth_type = str(auth_config.get("type") or "bearer").lower()
+
         test_cases_list: List[Dict[str, Any]] = []
         for item in result_model.test_cases:
             tc_dict = item.model_dump()
@@ -78,6 +83,21 @@ async def generate_category_test_cases(
             tc_dict["id"] = generate_test_case_id(category)
             tc_dict["category"] = category
             tc_dict["generated_by"] = f"{category}_generator_v1"
+
+            # Populate auth headers if auth_config is provided and this is not a negative auth test
+            if auth_config and token and category not in ("auth", "authz"):
+                req_dict = tc_dict.get("request", {})
+                headers_dict = dict(req_dict.get("headers") or {})
+                if not any(k.lower() == "authorization" for k in headers_dict):
+                    if auth_type == "bearer":
+                        headers_dict["Authorization"] = token if str(token).startswith("Bearer ") else f"Bearer {token}"
+                    elif auth_type == "api_key":
+                        key_name = auth_config.get("name", "X-API-Key")
+                        headers_dict[key_name] = str(token)
+                    elif auth_type == "basic":
+                        headers_dict["Authorization"] = str(token) if str(token).startswith("Basic ") else f"Basic {token}"
+                req_dict["headers"] = headers_dict
+                tc_dict["request"] = req_dict
 
             # Strict validation against full TestCaseGeneratedModel
             full_model = TestCaseGeneratedModel(**tc_dict)
@@ -99,10 +119,15 @@ async def generate_category_test_cases(
             path = ep.get("path", "/")
             method = ep.get("method", "GET").upper()
 
-            # Clean path template placeholders: e.g. {task_id} -> task_001, {id} -> 1, {username} -> user1
+            # Clean path template placeholders: use realistic 24-char hex ObjectIds for string IDs
             clean_path = (
-                path.replace("{task_id}", "task_001")
-                    .replace("{id}", "1")
+                path.replace("{task_id}", "64b8f0e9e5162e84ea981e01")
+                    .replace("{plan_id}", "64b8f0e9e5162e84ea981e01")
+                    .replace("{user_id}", "64b8f0e9e5162e84ea981e01")
+                    .replace("{profile_id}", "64b8f0e9e5162e84ea981e01")
+                    .replace("{photo_id}", "64b8f0e9e5162e84ea981e01")
+                    .replace("{faq_id}", "64b8f0e9e5162e84ea981e01")
+                    .replace("{id}", "64b8f0e9e5162e84ea981e01")
                     .replace("{petId}", "1")
                     .replace("{username}", "user1")
                     .replace("{orderId}", "1")
@@ -110,67 +135,94 @@ async def generate_category_test_cases(
 
             # Determine schema-valid body and expected status code
             body = None
+            headers = {}
             expected_code = 200
 
-            if category == "functional":
-                if method in ("POST", "PUT", "PATCH"):
-                    if "user" in path or "user" in op_id:
-                        body = {
-                            "id": 1,
-                            "username": "user1",
-                            "firstName": "John",
-                            "lastName": "Doe",
-                            "email": "john@example.com",
-                            "password": "password123",
-                            "phone": "1234567890",
-                            "userStatus": 1
-                        }
-                        if "array" in op_id.lower() or "list" in op_id.lower():
-                            body = [body]
-                    elif "order" in path or "order" in op_id:
-                        body = {
-                            "id": 1,
-                            "petId": 1,
-                            "quantity": 1,
-                            "shipDate": "2026-08-05T10:00:00.000Z",
-                            "status": "placed",
-                            "complete": True
-                        }
-                    elif "pet" in path or "pet" in op_id:
-                        body = {
-                            "id": 1,
-                            "name": "doggie",
-                            "category": {"id": 1, "name": "Dogs"},
-                            "photoUrls": ["http://example.com/photo.jpg"],
-                            "tags": [{"id": 1, "name": "tag1"}],
-                            "status": "available"
-                        }
-                    elif "task" in path or "task" in op_id:
-                        body = {"title": "Sample Test Task", "description": "Automated test task", "priority": "high", "completed": False}
-                    else:
-                        body = {"title": "Test Item", "name": "Test Item"}
+            # 1. Build appropriate request body based on endpoint operation
+            if method in ("POST", "PUT", "PATCH"):
+                if "toggle" in path or "toggle" in op_id:
+                    body = {"status": "active"}
+                elif "update" in path or "update" in op_id:
+                    body = {
+                        "plan_name": f"Updated_{uuid.uuid4().hex[:6]}",
+                        "plan_description": "Updated test plan description",
+                        "plan_feature": ["feature1", "feature2"]
+                    }
+                elif "user" in path or "user" in op_id:
+                    body = {
+                        "id": 1,
+                        "username": "user1",
+                        "firstName": "John",
+                        "lastName": "Doe",
+                        "email": "john@example.com",
+                        "password": "password123",
+                        "phone": "1234567890",
+                        "userStatus": 1
+                    }
+                    if "array" in op_id.lower() or "list" in op_id.lower():
+                        body = [body]
+                elif "order" in path or "order" in op_id:
+                    body = {
+                        "id": 1,
+                        "petId": 1,
+                        "quantity": 1,
+                        "shipDate": "2026-08-05T10:00:00.000Z",
+                        "status": "placed",
+                        "complete": True
+                    }
+                elif "pet" in path or "pet" in op_id:
+                    body = {
+                        "id": 1,
+                        "name": "doggie",
+                        "category": {"id": 1, "name": "Dogs"},
+                        "photoUrls": ["http://example.com/photo.jpg"],
+                        "tags": [{"id": 1, "name": "tag1"}],
+                        "status": "available"
+                    }
+                elif "task" in path or "task" in op_id:
+                    body = {"title": f"Task_{uuid.uuid4().hex[:6]}", "description": "Automated test task", "priority": "high", "completed": False}
+                elif "plan" in path or "plan" in op_id or "subscription" in path:
+                    body = {
+                        "plan_name": f"Plan_{uuid.uuid4().hex[:6]}",
+                        "plan_price": 19.99,
+                        "plan_duration": "year",
+                        "plan_feature": ["feature1", "feature2"],
+                        "plan_description": "Automated test plan description"
+                    }
+                else:
+                    body = {"title": f"Item_{uuid.uuid4().hex[:6]}", "name": f"Item_{uuid.uuid4().hex[:6]}"}
+
+            # 2. Configure category-specific assertions and headers
+            if category == "authz":
+                headers["Authorization"] = "Bearer invalid_token"
+                expected_code = 403
+            elif category in ("edge_case", "negative"):
+                if "toggle" in path or "toggle" in op_id:
+                    body = {"status": "invalid_status"}
+                    expected_code = 422
+                elif "update" in path or "update" in op_id:
+                    body = {"plan_price": -10.0}
+                    expected_code = 422
+                elif method == "POST" and ("create" in op_id or "plan" in path):
+                    body = {
+                        "plan_name": f"EdgePlan_{uuid.uuid4().hex[:6]}",
+                        "plan_price": -10.99,
+                        "plan_duration": "year",
+                        "plan_feature": ["feature1"],
+                        "plan_description": "Invalid negative price test"
+                    }
+                    expected_code = 422
+                elif method == "GET" and ("list" in path or "list" in op_id):
+                    expected_code = 200
+                else:
+                    expected_code = 422 if method in ("POST", "PATCH") else 400
+            elif category == "functional":
+                if isinstance(body, dict) and ("create" in op_id or "create" in path):
+                    body["plan_duration"] = "year"
                 if method == "POST":
-                    expected_code = 200 if ("pet" in path or "user" in path or "order" in path) else 201
+                    expected_code = 200 if ("pet" in path or "user" in path or "order" in path or "subscription" in path or "plan" in path) else 201
                 elif method == "DELETE":
                     expected_code = 204 if ("204" in ep.get("response_schemas", {}) or "task" in path) else 200
-
-            elif category == "negative":
-                expected_code = 404 if "{" in path else 400
-                if method == "POST":
-                    body = {}  # missing required fields triggers 400 validation error
-                elif "{" in path:
-                    clean_path = (
-                        path.replace("{task_id}", "nonexistent_id_9999")
-                            .replace("{id}", "999999")
-                            .replace("{petId}", "999999")
-                            .replace("{username}", "nonexistent_user_9999")
-                            .replace("{orderId}", "999999")
-                    )
-
-            elif category == "security":
-                expected_code = 200
-                if method in ("POST", "PUT", "PATCH"):
-                    body = {"title": "Security Audit Task", "priority": "medium", "completed": False}
 
             tc_dict = {
                 "id": generate_test_case_id(category),
@@ -181,7 +233,7 @@ async def generate_category_test_cases(
                 "request": {
                     "method": method,
                     "path": clean_path,
-                    "headers": {},
+                    "headers": headers,
                     "query_params": {},
                     "body": body
                 },
