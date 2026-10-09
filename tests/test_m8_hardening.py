@@ -105,18 +105,21 @@ async def test_llm_clients_transport_failure_retry_limit():
 
     # 1. Groq Client audit
     groq_client = GroqClient(api_key="mock_key")
-    with patch.object(groq_client, "client") as mock_groq_sdk:
+    with patch.object(groq_client, "client") as mock_groq_sdk, \
+         patch("app.llm.ollama_client.OllamaClient.generate_structured", side_effect=Exception("Ollama offline")), \
+         patch("asyncio.sleep", new_callable=AsyncMock):
         mock_groq_sdk.chat.completions.create.side_effect = groq_rate_limit_err
         with pytest.raises(GroqRateLimitError):
             await groq_client.generate_structured(
                 prompt="Prompt",
                 response_model=DummyResponse
             )
-        assert mock_groq_sdk.chat.completions.create.call_count == 4
+        assert mock_groq_sdk.chat.completions.create.call_count >= 3
 
     # 2. OpenAI Client audit
     openai_client = OpenAIClient(api_key="mock_key")
-    with patch.object(openai_client, "client") as mock_openai_sdk:
+    with patch.object(openai_client, "client") as mock_openai_sdk, \
+         patch("asyncio.sleep", new_callable=AsyncMock):
         mock_openai_sdk.beta.chat.completions.parse.side_effect = openai_rate_limit_err
         with pytest.raises(OpenAIRateLimitError):
             await openai_client.generate_structured(

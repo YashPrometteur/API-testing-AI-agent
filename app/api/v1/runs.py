@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Request
 from pydantic import BaseModel, Field
 
 from app.config.settings import settings
@@ -83,6 +83,9 @@ async def _execute_run_background(
         update_data = {
             "endpoints": graph_res.get("endpoints", []),
             "test_plan": graph_res.get("test_plan", {}),
+            "test_cases": graph_res.get("test_cases", []),
+            "execution_results": graph_res.get("execution_results", []),
+            "findings": graph_res.get("findings", []),
             "errors": graph_res.get("errors", []),
             "updated_at": current_utc_iso(),
         }
@@ -180,9 +183,18 @@ async def get_run(run_id: str):
         finding_repo = FindingRepository(db)
         pending_findings = await finding_repo.find_pending_review_by_run(run_id)
         run_doc["pending_review_count"] = len(pending_findings)
-        run_doc["pending_review_url"] = f"/api/v1/reviews/pending?run_id={run_id}"
+        run_doc["pending_review_url"] = f"/api/v1/defects/pending?run_id={run_id}"
 
     return run_doc
+
+
+@router.post("/{run_id}/approve")
+@router.post("/{run_id}/approve-all")
+@router.post("/{run_id}/bulk-approve")
+async def approve_run(run_id: str, request: Request):
+    """Approve all pending findings for a run in 1-click and resume execution to generate report."""
+    from app.api.v1.reviews import bulk_approve_reviews
+    return await bulk_approve_reviews(run_id=run_id, request=request)
 
 
 @router.get("/{run_id}/history")

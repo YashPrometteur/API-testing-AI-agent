@@ -106,7 +106,17 @@ class DiscoveryAgent:
                     }
                     endpoints.append(endpoint_obj)
 
-            logger.info(f"[DISCOVERY] Total raw endpoints extracted from spec: {len(endpoints)}")
+            # Deduplicate endpoints by (method, path)
+            seen_ops = set()
+            unique_endpoints = []
+            for ep in endpoints:
+                op_key = (ep.get("method", "").upper(), ep.get("path", ""))
+                if op_key not in seen_ops:
+                    seen_ops.add(op_key)
+                    unique_endpoints.append(ep)
+            endpoints = unique_endpoints
+
+            logger.info(f"[DISCOVERY] Total unique endpoints extracted from spec: {len(endpoints)}")
 
             # Filter by target_operations / target_endpoints if specified
             target_operations = state.get("target_operations") or []

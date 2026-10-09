@@ -28,8 +28,8 @@ async def response_validation_node(state: TestRunState) -> Dict[str, Any]:
         tc_id = res["test_case_id"]
         tc = tc_map.get(tc_id)
 
-        # If already marked error (e.g. circuit breaker open)
-        if res.get("status") == "error" and res.get("actual_status_code") is None:
+        # If already marked error or not_executed (e.g. circuit breaker open)
+        if res.get("status") in ("error", "not_executed") and res.get("actual_status_code") is None:
             validated_results.append(res)
             continue
 

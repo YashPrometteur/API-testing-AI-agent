@@ -39,13 +39,26 @@ class PlannerAgent:
                 "a comprehensive TestPlan mapping operation_id to test categories, case counts, and priority."
             )
 
+        compact_endpoints = [
+            {
+                "operation_id": ep.get("operation_id"),
+                "method": ep.get("method"),
+                "path": ep.get("path"),
+                "summary": ep.get("summary", ""),
+                "description": (ep.get("description") or "")[:100],
+                "parameters": [p.get("name") for p in ep.get("parameters", []) if isinstance(p, dict)],
+                "tags": ep.get("tags", [])
+            }
+            for ep in endpoints if isinstance(ep, dict)
+        ]
+
         prompt_user = (
             f"Analyze the following OpenAPI endpoints and generate a TestPlan:\n\n"
-            f"{json.dumps(endpoints, indent=2)}"
+            f"{json.dumps(compact_endpoints, indent=2)}"
         )
 
         requested_categories = state.get("categories") or []
-        target_cats = [c.lower() for c in requested_categories] if requested_categories else ["functional", "negative", "security"]
+        target_cats = [c.lower() for c in requested_categories] if requested_categories else ["functional", "negative", "edge_case", "security", "auth", "authz"]
 
         try:
             logger.info(f"PlannerAgent received {len(endpoints)} endpoints: {[ep.get('operation_id') for ep in endpoints if isinstance(ep, dict)]}")
@@ -66,7 +79,7 @@ class PlannerAgent:
                     existing_counts = op_plan.get("target_case_count", {})
                     op_plan["categories"] = list(target_cats)
                     op_plan["target_case_count"] = {
-                        cat: existing_counts.get(cat, 1) for cat in target_cats
+                        cat: existing_counts.get(cat, 3) for cat in target_cats
                     }
                 logger.info(f"PlannerAgent enforced user-requested categories {target_cats} across {len(plan_map)} operations (overriding any LLM-proposed subset).")
 
@@ -87,7 +100,7 @@ class PlannerAgent:
                 op_id = ep.get("operation_id") or f"op_{ep.get('method', 'get').lower()}_{ep.get('path', '').replace('/', '_')}"
                 fallback_plan[op_id] = {
                     "categories": target_cats,
-                    "target_case_count": {c: 1 for c in target_cats},
+                    "target_case_count": {c: 3 for c in target_cats},
                     "priority": "medium"
                 }
             return {

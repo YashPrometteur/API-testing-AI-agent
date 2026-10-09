@@ -282,7 +282,7 @@ async def test_full_m4_execution_graph_fan_out(monkeypatch):
 
     client = TestClient(mock_app)
 
-    async def mock_execute(method, url, headers=None, query_params=None, body=None, expected_status_code=None, max_retries=3, client=None):
+    async def mock_execute(method, url, headers=None, query_params=None, body=None, expected_status_code=None, max_retries=3, client=None, **kwargs):
         req_kwargs = {}
         if body and isinstance(body, dict):
             req_kwargs["json"] = body

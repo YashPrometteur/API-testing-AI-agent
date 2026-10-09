@@ -56,8 +56,18 @@ def is_discovery_endpoint(tc: TestCase) -> bool:
     return method == "GET" and not has_id_deps and is_collection and cat in ("functional", "edge_case")
 
 
+def is_terminal_action(tc: TestCase) -> bool:
+    """Identify terminal lifecycle actions that invalidate the active session (e.g. POST /logout, deactivate)."""
+    req = tc.get("request", {})
+    path = req.get("path", "").lower()
+    op_id = tc.get("endpoint_operation_id", "").lower()
+    return any(t in path or t in op_id for t in ("logout", "deactivate", "signout", "delete_account"))
+
+
 def is_resource_creator(tc: TestCase) -> bool:
     """Identify if a test case creates a primary resource without requiring existing IDs (e.g. POST /create_subscription)."""
+    if is_terminal_action(tc):
+        return False
     req = tc.get("request", {})
     path = req.get("path", "").lower()
     op_id = tc.get("endpoint_operation_id", "").lower()
@@ -76,25 +86,102 @@ def is_resource_deleter(tc: TestCase) -> bool:
     return method == "DELETE"
 
 
-def sort_test_cases_by_dependency(test_cases: List[TestCase]) -> List[TestCase]:
-    """Sort test cases: Discoverers -> Creators -> Dependents (Toggle -> Read -> Update) -> Others -> Deleters (DELETE)."""
+def get_onboarding_step_rank(tc: TestCase) -> int:
+    """Return explicit rank for multi-step onboarding, CRUD lifecycle, and terminal actions."""
+    if is_terminal_action(tc):
+        return 999
+    req = tc.get("request", {})
+    path = req.get("path", "").lower()
+    op_id = tc.get("endpoint_operation_id", "").lower()
+    method = req.get("method", "GET").upper()
+    
+    # 1. Onboarding Guest Auth Steps (Must run first)
+    if "request-otp" in path or "request_otp" in op_id:
+        return 10
+    elif "verify-otp" in path or "verify_otp" in op_id or "verify_primary_otp" in op_id:
+        return 20
+    elif "add-secondary" in path or "add_secondary" in op_id:
+        return 30
+    elif "verify-secondary" in path or "verify_secondary" in op_id:
+        return 40
+    elif "register" in path or "register" in op_id:
+        return 50
+    # 2. Master Data / Options Discovery (Dropdowns, lookup tables, options)
+    elif ("options" in path or "options" in op_id) and method == "GET":
+        return 55
+    # 3. Post-Registration Profile & Preference Setup
+    elif "preferences-update" in path or "preferences_update" in op_id or "preference" in path:
+        return 60
+    elif "profile-update" in path or "profile_update" in op_id:
+        return 65
+    # 4. Resource Uploads / Creators
+    elif "upload" in path or "upload_images" in op_id or (method == "POST" and "image" in path):
+        return 70
+    elif "images" in path and method == "GET":
+        return 75
+    # 5. Entity Inspections & Updates
+    elif "profile" in path and method == "GET":
+        return 80
+    elif "profile" in path and method in ("PATCH", "PUT"):
+        return 85
+    # 6. Resource Deletions
+    elif "delete" in path or method == "DELETE":
+        return 90
+    return 100
+
+
+def sort_functional_workflow_chain(test_cases: List[TestCase]) -> List[TestCase]:
+    """Sort functional test cases in strict dependency order:
+    1. Collection Discoverers (GET list)
+    2. Multi-step Onboarding (request-otp -> verify-otp -> add-secondary -> verify-secondary -> register -> preferences -> profile)
+    3. Generic Resource Creators (POST create)
+    4. Dependents (Activate/Toggle -> GET details -> PATCH/PUT update)
+    5. Deleters (DELETE)
+    6. Terminal Actions (POST logout, deactivate) - ALWAYS LAST
+    """
     discoverers = []
+    onboarding = []
     creators = []
     dependents = []
     deleters = []
+    terminal_actions = []
     others = []
 
     for tc in test_cases:
-        if is_resource_deleter(tc):
+        if is_terminal_action(tc):
+            terminal_actions.append(tc)
+        elif is_resource_deleter(tc):
             deleters.append(tc)
         elif is_discovery_endpoint(tc):
             discoverers.append(tc)
+        elif get_onboarding_step_rank(tc) < 100:
+            onboarding.append(tc)
         elif is_resource_creator(tc):
             creators.append(tc)
         elif extract_resource_id_dependencies(tc):
             dependents.append(tc)
         else:
             others.append(tc)
+
+    # Form canonical 1-to-1 sequential onboarding chain (1 testcase per step: rank 10 -> 20 -> 30 -> 40 -> 50 -> 60 -> 65)
+    onboarding_map: Dict[int, TestCase] = {}
+    extra_onboarding: List[TestCase] = []
+
+    for tc in onboarding:
+        rank = get_onboarding_step_rank(tc)
+        if rank not in onboarding_map:
+            onboarding_map[rank] = tc
+        else:
+            existing = onboarding_map[rank]
+            is_new_full = "full" in str(tc.get("name", "")).lower() or tc.get("priority") == "high"
+            is_exist_full = "full" in str(existing.get("name", "")).lower() or existing.get("priority") == "high"
+            if is_new_full and not is_exist_full:
+                extra_onboarding.append(existing)
+                onboarding_map[rank] = tc
+            else:
+                extra_onboarding.append(tc)
+
+    canonical_onboarding = [onboarding_map[r] for r in sorted(onboarding_map.keys())]
 
     # Sub-sort dependents: Toggles (activate) -> GET details (read) -> PATCH updates (modify)
     def dependent_sort_key(tc):
@@ -110,20 +197,30 @@ def sort_test_cases_by_dependency(test_cases: List[TestCase]) -> List[TestCase]:
 
     dependents.sort(key=dependent_sort_key)
 
-    # Topological order:
-    # 1. Discoverers (GET list)
-    # 2. Creators (POST create)
-    # 3. Dependents (POST toggle -> GET details -> PATCH update)
-    # 4. Others (Authz / standalone edge cases)
-    # 5. Deleters (DELETE)
-    return discoverers + creators + dependents + others + deleters
+    return discoverers + canonical_onboarding + extra_onboarding + creators + dependents + others + deleters + terminal_actions
+
+
+def sort_test_cases_by_dependency(test_cases: List[TestCase]) -> List[TestCase]:
+    """Sort test cases by Track:
+    Track 1: Functional / Happy-Path E2E Workflow Chain (Maintains session & resource state)
+    Track 2: Negative, Boundary, Edge-Case, Security, and Auth Suites (Isolated Sandboxes)
+    """
+    functional_tcs = [tc for tc in test_cases if str(tc.get("category", "")).lower() == "functional"]
+    non_functional_tcs = [tc for tc in test_cases if str(tc.get("category", "")).lower() != "functional"]
+
+    ordered_functional = sort_functional_workflow_chain(functional_tcs)
+    ordered_non_functional = sort_functional_workflow_chain(non_functional_tcs)
+
+    # Track 1 (Happy Path) runs first, followed by Track 2 (Isolated Negatives)
+    return ordered_functional + ordered_non_functional
 
 
 async def execution_planner_node(state: TestRunState) -> Dict[str, Any]:
     """Execution Planner Node (Deterministic, no LLM call).
 
-    Orders test cases by dependency and batches them according to host rate limits.
-    During reflection re-execution cycles, filters target test cases to only failed/errored cases.
+    Orders test cases by category track and dependency, batching them so that
+    functional happy-path workflows maintain uninterrupted state progression
+    while negative/boundary tests execute in isolated sandbox batches.
     """
     test_cases = state.get("test_cases", [])
     execution_results = state.get("execution_results", [])
@@ -155,23 +252,38 @@ async def execution_planner_node(state: TestRunState) -> Dict[str, Any]:
             "status": "running"
         }
 
-    # 1. Sort test cases with creator-before-dependent dependency ordering
-    ordered_test_cases = sort_test_cases_by_dependency(test_cases_to_plan)
+    # Separate into Track 1 (Functional) and Track 2 (Negative / Edge Case / Security)
+    functional_tcs = [tc for tc in test_cases_to_plan if str(tc.get("category", "")).lower() == "functional"]
+    non_functional_tcs = [tc for tc in test_cases_to_plan if str(tc.get("category", "")).lower() != "functional"]
 
-    # 2. Group into execution batches based on DEFAULT_MAX_CONCURRENT limit
+    ordered_functional = sort_functional_workflow_chain(functional_tcs)
+    ordered_non_functional = sort_functional_workflow_chain(non_functional_tcs)
+
     batch_size = DEFAULT_MAX_CONCURRENT
     batches = []
-    for i in range(0, len(ordered_test_cases), batch_size):
-        batch_items = ordered_test_cases[i : i + batch_size]
-        batch_dict = {
-            "batch_id": f"batch_{len(batches) + 1}",
-            "test_cases": batch_items
-        }
-        batches.append(batch_dict)
+
+    # 1. Plan Track 1: Functional Happy-Path Batch (Sequential flow in 1 batch)
+    if ordered_functional:
+        batches.append({
+            "batch_id": "batch_functional_1",
+            "track": "functional",
+            "test_cases": ordered_functional
+        })
+
+    # 2. Plan Track 2: Negative & Boundary Isolation Batches
+    if ordered_non_functional:
+        for i in range(0, len(ordered_non_functional), batch_size):
+            batch_items = ordered_non_functional[i : i + batch_size]
+            batches.append({
+                "batch_id": f"batch_isolated_{len(batches) + 1}",
+                "track": "negative_isolated",
+                "test_cases": batch_items
+            })
 
     logger.info(
-        f"[EXECUTION_PLANNER] Successfully created {len(batches)} execution batches "
-        f"for operations {list(unique_ops)} (max {batch_size} cases per batch)."
+        f"[EXECUTION_PLANNER] Created {len(batches)} batches "
+        f"({len(functional_tcs)} functional, {len(non_functional_tcs)} negative/isolated) "
+        f"for operations {list(unique_ops)}."
     )
 
     return {

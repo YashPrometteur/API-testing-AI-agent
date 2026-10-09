@@ -16,7 +16,7 @@ async def reflection_agent_node(state: TestRunState) -> Dict[str, Any]:
     reflection_count = state.get("reflection_count", 0)
 
     # 1. Detect and mark Flaky tests
-    # If a test case has flipped status (at least one pass and one fail/error) across runs, mark it flaky.
+    # Flaky should ONLY be assigned when the result differs across multiple attempts (>= 2) in the current run.
     results_by_tc: Dict[str, List[ExecutionResult]] = {}
     for res in execution_results:
         tc_id = res["test_case_id"]
@@ -24,13 +24,28 @@ async def reflection_agent_node(state: TestRunState) -> Dict[str, Any]:
 
     updated_execution_results = list(execution_results)
     for tc_id, runs in results_by_tc.items():
-        has_pass = any(r.get("status") == "pass" for r in runs)
-        has_fail = any(r.get("status") in ("fail", "error", "flaky") for r in runs)
-        if has_pass and has_fail:
-            logger.info(f"[REFLECTION_AGENT] Flaky test case detected: '{tc_id}'. Marking all runs as flaky.")
+        history_statuses = []
+        for r in runs:
+            if r.get("history"):
+                history_statuses.extend([h.get("status", "").lower() for h in r["history"]])
+            else:
+                history_statuses.append(r.get("status", "").lower())
+
+        total_attempts = len(history_statuses)
+        has_pass = any(s == "pass" for s in history_statuses)
+        has_fail = any(s in ("fail", "error") for s in history_statuses)
+
+        if total_attempts >= 2 and has_pass and has_fail:
+            logger.info(f"[REFLECTION_AGENT] Flaky test case detected: '{tc_id}' ({total_attempts} attempts). Marking as flaky.")
             for res in updated_execution_results:
                 if res["test_case_id"] == tc_id:
                     res["status"] = "flaky"
+        elif total_attempts <= 1:
+            # Single attempt can NEVER be flaky
+            for res in updated_execution_results:
+                if res["test_case_id"] == tc_id and res.get("status") == "flaky":
+                    single_s = history_statuses[0] if history_statuses else "pass"
+                    res["status"] = single_s if single_s in ("pass", "fail", "error") else "pass"
 
     # 2. Reflection loop decision logic
     loop_back = False

@@ -24,7 +24,7 @@ client = TestClient(app)
 async def cleanup_db():
     from app.database import get_mongo_db
     db = await get_mongo_db()
-    test_id_pattern = {"_id": {"$regex": "^(test_|mock_|run_conc|find_conc|def_conc|find_new_dup|def_existing)"}}
+    test_id_pattern = {"_id": {"$regex": "^(test_|mock_|run_conc|find_conc|def_conc|find_new_dup|def_existing|run_bulk|find_bulk|def_bulk)"}}
     await db["runs"].delete_many(test_id_pattern)
     await db["findings"].delete_many(test_id_pattern)
     await db["defects"].delete_many(test_id_pattern)
@@ -212,8 +212,21 @@ async def test_semantic_deduplication(cleanup_db):
 
 
 @pytest.mark.asyncio
-async def test_concurrent_reviews_and_resumption(cleanup_db):
+async def test_concurrent_reviews_and_resumption(cleanup_db, monkeypatch):
     """Verify concurrent pending reviews handling: only the final decision resumes execution."""
+    from unittest.mock import AsyncMock
+    mock_llm = AsyncMock()
+    mock_llm.embed.return_value = [0.0] * 1536
+    from app.agents.reporting.reporting_agent import ReportSummary
+    mock_llm.generate_structured.return_value = ReportSummary(summary_text="Reviews completed and graph resumed successfully.")
+    import app.llm as llm_module
+    import app.agents.reporting.reporting_agent as reporting_module
+    import app.tools.embeddings as emb_module
+
+    monkeypatch.setattr(llm_module, "get_llm_client", lambda: mock_llm)
+    monkeypatch.setattr(reporting_module, "get_llm_client", lambda: mock_llm)
+    monkeypatch.setattr(emb_module, "get_llm_client", lambda: mock_llm)
+
     db = cleanup_db
     run_id = f"run_{uuid.uuid4().hex[:8]}"
 
@@ -272,9 +285,10 @@ async def test_concurrent_reviews_and_resumption(cleanup_db):
         "status": "awaiting_human",
         "pending_human_review": ["find_conc_1", "find_conc_2"]
     }
-    # Invoke guardrail_interrupt node to pause graph at interrupt()
+    # Update checkpoint state as output of guardrail node and run guardrail_interrupt node to pause at interrupt()
+    await graph.aupdate_state(config, initial_state, as_node="guardrail")
     try:
-        await graph.ainvoke(initial_state, config=config)
+        await graph.ainvoke(None, config=config)
     except Exception:
         pass
 
@@ -316,4 +330,89 @@ async def test_concurrent_reviews_and_resumption(cleanup_db):
     assert defects_created[0].startswith("def_")
     assert "find_conc_1" not in defects_created
     assert "find_conc_2" not in defects_created
+
+
+@pytest.mark.asyncio
+async def test_bulk_approve_all_pending_reviews(cleanup_db):
+    """Verify that 1-click bulk approve endpoint approves all pending reviews and resumes run immediately."""
+    db = cleanup_db
+    run_id = f"run_bulk_{uuid.uuid4().hex[:8]}"
+    fid1 = f"find_bulk_{uuid.uuid4().hex[:6]}"
+    fid2 = f"find_bulk_{uuid.uuid4().hex[:6]}"
+
+    # Setup run and pending findings
+    await db["runs"].insert_one({
+        "_id": run_id,
+        "spec_id": "petstore_spec",
+        "status": "awaiting_human",
+        "pending_review_count": 2,
+        "created_at": current_utc_iso()
+    })
+    await db["findings"].insert_many([
+        {
+            "_id": fid1,
+            "run_id": run_id,
+            "test_case_id": "tc_1",
+            "severity": "critical",
+            "confidence": 0.95,
+            "root_cause_summary": "Bulk critical finding 1",
+            "suggested_fix": "Fix server crash",
+            "supporting_evidence": [],
+            "is_duplicate": False,
+            "guardrail_status": "pending_review"
+        },
+        {
+            "_id": fid2,
+            "run_id": run_id,
+            "test_case_id": "tc_2",
+            "severity": "high",
+            "confidence": 0.90,
+            "root_cause_summary": "Bulk high finding 2",
+            "suggested_fix": "Fix validation",
+            "supporting_evidence": [],
+            "is_duplicate": False,
+            "guardrail_status": "pending_review"
+        }
+    ])
+
+    checkpointer = MongoCheckpointSaver(db=db)
+    graph = build_graph(checkpointer=checkpointer)
+    config = {"configurable": {"thread_id": run_id}}
+
+    initial_state = {
+        "run_id": run_id,
+        "test_cases": [
+            {"id": "tc_1", "name": "Create User", "endpoint_operation_id": "createUser"},
+            {"id": "tc_2", "name": "Update User", "endpoint_operation_id": "updateUser"}
+        ],
+        "findings": [
+            {"id": fid1, "test_case_id": "tc_1", "severity": "critical", "confidence": 0.95, "root_cause_summary": "Bulk critical finding 1", "suggested_fix": "Fix server crash", "supporting_evidence": [], "is_duplicate": False, "guardrail_status": "pending_review"},
+            {"id": fid2, "test_case_id": "tc_2", "severity": "high", "confidence": 0.90, "root_cause_summary": "Bulk high finding 2", "suggested_fix": "Fix validation", "supporting_evidence": [], "is_duplicate": False, "guardrail_status": "pending_review"}
+        ],
+        "execution_results": [
+            {"test_case_id": "tc_1", "status": "fail", "actual_status_code": 500, "latency_ms": 10.0, "attempt_count": 1, "schema_valid": False, "assertion_failures": ["Server error"], "executed_at": "2026-08-18T00:00:00Z"},
+            {"test_case_id": "tc_2", "status": "fail", "actual_status_code": 404, "latency_ms": 12.0, "attempt_count": 1, "schema_valid": True, "assertion_failures": ["Status mismatch"], "executed_at": "2026-08-18T00:00:00Z"}
+        ],
+        "status": "awaiting_human",
+        "pending_human_review": [fid1, fid2]
+    }
+    await graph.aupdate_state(config, initial_state, as_node="guardrail")
+    try:
+        await graph.ainvoke(None, config=config)
+    except Exception:
+        pass
+
+    # Call 1-click bulk approve endpoint
+    resp = client.post(f"/api/v1/defects/runs/{run_id}/approve-all", json={"reviewer": "qa_lead", "notes": "1-click approved"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["approved_count"] == 2
+    assert data["run_resumed"] is True
+    assert len(data["created_defects"]) == 2
+
+    # Verify run completed
+    run_doc = client.get(f"/api/v1/runs/{run_id}").json()
+    assert run_doc["status"] == "completed"
+    assert "final_report" in run_doc
+
 

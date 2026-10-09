@@ -6,7 +6,7 @@ from app.config.settings import settings
 from app.repositories.run_repository import RunRepository
 
 logger = logging.getLogger("reports_api")
-router = APIRouter(prefix="/runs", tags=["reports"])
+router = APIRouter(tags=["reports"])
 
 
 @router.get("/{run_id}/report")
@@ -58,11 +58,11 @@ async def get_run_report(run_id: str, format: Literal["json", "html", "pdf"] = "
     if format == "json":
         return final_report
 
-    # Retrieve full report document containing HTML/PDF payloads
+    # Retrieve full report document containing stored payloads
     report_doc = await db["reports"].find_one({"_id": run_id})
-    html_content = report_doc.get("html_content") if report_doc else None
 
     if format == "html":
+        html_content = report_doc.get("html_content") if report_doc else None
         if not html_content:
             from app.tools.report_renderer import ReportRendererTool
             try:
@@ -85,3 +85,11 @@ async def get_run_report(run_id: str, format: Literal["json", "html", "pdf"] = "
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=f"Unsupported format query parameter '{format}'."
     )
+
+
+@router.get("/{run_id}/html")
+@router.get("/{run_id}/report/html")
+@router.get("/{run_id}/report.html")
+async def get_run_report_html(run_id: str):
+    """Direct shortcut endpoint for HTML report."""
+    return await get_run_report(run_id=run_id, format="html")

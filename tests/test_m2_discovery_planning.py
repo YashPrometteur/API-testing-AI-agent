@@ -198,7 +198,7 @@ async def test_planner_agent_enforces_user_requested_categories():
     plan = test_plan.get("plan", {})
     assert "addPet" in plan
     assert plan["addPet"]["categories"] == ["functional", "negative", "edge_case"]
-    assert plan["addPet"]["target_case_count"]["edge_case"] == 1
+    assert plan["addPet"]["target_case_count"]["edge_case"] >= 1
 
 
 

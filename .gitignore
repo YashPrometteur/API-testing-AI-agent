@@ -29,3 +29,8 @@ ENV/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Generated reports & logs
+reports/
+*.log
+

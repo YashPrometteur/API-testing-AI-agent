@@ -21,6 +21,8 @@ class OpenRouterClient:
         self.client = AsyncOpenAI(
             api_key=self.api_key,
             base_url="https://openrouter.ai/api/v1",
+            timeout=8.0,
+            max_retries=0,
             default_headers={
                 "HTTP-Referer": "http://localhost:8001",
                 "X-Title": "AI API Testing Agent",
@@ -49,7 +51,7 @@ class OpenRouterClient:
             {"role": "user", "content": prompt}
         ]
 
-        max_attempts = 3
+        max_attempts = 1
         last_exception = None
 
         for attempt in range(1, max_attempts + 1):
@@ -59,19 +61,74 @@ class OpenRouterClient:
                     messages=messages,
                     response_format={"type": "json_object"},
                     temperature=temperature,
-                    max_tokens=1500,
+                    max_tokens=4000,
                 )
                 raw_text = response.choices[0].message.content or ""
+                logger.info(f"[OPENROUTER_CLIENT] Raw response received ({len(raw_text)} chars): {raw_text[:250]}...")
+                
+                # Extract pure JSON payload from any surrounding conversational text / reasoning
                 raw_text_clean = raw_text.strip()
-                if raw_text_clean.startswith("```json"):
-                    raw_text_clean = raw_text_clean[7:]
-                if raw_text_clean.startswith("```"):
-                    raw_text_clean = raw_text_clean[3:]
-                if raw_text_clean.endswith("```"):
-                    raw_text_clean = raw_text_clean[:-3]
-                raw_text_clean = raw_text_clean.strip()
+                if "<think>" in raw_text_clean and "</think>" in raw_text_clean:
+                    raw_text_clean = raw_text_clean.split("</think>")[-1].strip()
 
-                return response_model.model_validate_json(raw_text_clean)
+                parsed_json = None
+
+                # 1. Check all markdown code blocks (in reverse order, prioritizing the final structured block)
+                import re
+                code_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", raw_text_clean)
+                for block in reversed(code_blocks):
+                    block_str = block.strip()
+                    try:
+                        candidate = json.loads(block_str)
+                        if isinstance(candidate, (dict, list)):
+                            parsed_json = candidate
+                            break
+                    except Exception:
+                        pass
+
+                # 2. If no valid code block found, find candidate JSON substring by bracket matching
+                if parsed_json is None:
+                    # Look for outermost or inner JSON candidates
+                    for start_char, end_char in [("{", "}"), ("[", "]")]:
+                        start_pos = 0
+                        while True:
+                            s_idx = raw_text_clean.find(start_char, start_pos)
+                            if s_idx == -1:
+                                break
+                            e_idx = raw_text_clean.rfind(end_char)
+                            if e_idx > s_idx:
+                                sub = raw_text_clean[s_idx:e_idx + 1]
+                                try:
+                                    candidate = json.loads(sub)
+                                    if isinstance(candidate, (dict, list)):
+                                        parsed_json = candidate
+                                        break
+                                except Exception:
+                                    pass
+                            start_pos = s_idx + 1
+                        if parsed_json is not None:
+                            break
+
+                # 3. Last resort fallback to raw_text_clean
+                if parsed_json is None:
+                    try:
+                        parsed_json = json.loads(raw_text_clean)
+                    except Exception as parse_err:
+                        logger.error(f"[OPENROUTER_CLIENT] JSON/Schema Validation Error: {parse_err}\n[RAW LLM RESPONSE WAS]:\n{raw_text[:500]}...")
+                        raise parse_err
+
+                # Normalize list vs dict wrapper
+                if isinstance(parsed_json, list):
+                    parsed_json = {"test_cases": parsed_json}
+                elif isinstance(parsed_json, dict):
+                    if "test_cases" not in parsed_json:
+                        for alt_key in ["cases", "testCases", "test_case_list", "tests", "data"]:
+                            if alt_key in parsed_json and isinstance(parsed_json[alt_key], list):
+                                parsed_json["test_cases"] = parsed_json.pop(alt_key)
+                                break
+
+                return response_model.model_validate(parsed_json)
+
             except (RateLimitError, APIConnectionError, APIError) as e:
                 last_exception = e
                 if attempt < max_attempts:

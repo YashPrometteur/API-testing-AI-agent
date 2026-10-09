@@ -1,7 +1,7 @@
 import logging
 import uuid
 from typing import Any, Dict, Optional, Literal
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Request
 from pydantic import BaseModel, Field
 
 from app.config.settings import settings
@@ -14,8 +14,7 @@ from app.tools.embeddings import EmbeddingTool
 from app.tools.rag_retriever import get_chroma_client
 from app.utils.datetime import current_utc_iso
 
-logger = logging.getLogger("reviews_api")
-router = APIRouter(prefix="/defects")
+router = APIRouter()
 
 
 class ReviewPayload(BaseModel):
@@ -193,3 +192,162 @@ async def review_defect(defect_id: str, payload: ReviewPayload):
         "defect_id": created_defect_id or target_finding_id,
         "status": new_status
     }
+
+
+class BulkReviewPayload(BaseModel):
+    reviewer: str = "qa_lead"
+    notes: Optional[str] = "Bulk approved via 1-click action"
+
+
+@router.post("/runs/{run_id}/approve-all")
+@router.post("/runs/{run_id}/bulk-approve")
+async def bulk_approve_reviews(run_id: str, request: Request):
+    """Approve all pending reviews for a specific run in a single action and resume execution."""
+    reviewer = "qa_lead"
+    notes = "Bulk approved via 1-click action"
+
+    if request:
+        try:
+            body_bytes = await request.body()
+            if body_bytes:
+                import json
+                try:
+                    raw_data = json.loads(body_bytes.decode("utf-8"))
+                    if isinstance(raw_data, str):
+                        raw_data = json.loads(raw_data)
+                    if isinstance(raw_data, dict):
+                        reviewer = raw_data.get("reviewer", reviewer)
+                        notes = raw_data.get("notes", notes)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    payload = BulkReviewPayload(reviewer=reviewer, notes=notes)
+
+    from app.database import get_mongo_db
+    db = await get_mongo_db()
+
+    finding_repo = FindingRepository(db)
+    defect_repo = DefectRepository(db)
+    run_repo = RunRepository(db)
+
+    pending_findings = await finding_repo.find_pending_review_by_run(run_id)
+    if not pending_findings:
+        return {
+            "run_id": run_id,
+            "approved_count": 0,
+            "message": f"No pending reviews found for run '{run_id}'.",
+            "run_resumed": False
+        }
+
+    tc_map: Dict[str, Any] = {}
+    spec_id = ""
+    try:
+        run_doc = await run_repo.find_by_id(run_id)
+        if run_doc:
+            spec_id = run_doc.get("spec_id", "")
+        checkpointer = MongoCheckpointSaver(db=db)
+        graph = build_graph(checkpointer=checkpointer)
+        config = {"configurable": {"thread_id": run_id}}
+        state_snapshot = await graph.aget_state(config)
+        if state_snapshot and state_snapshot.values:
+            tc_map = {tc["id"]: tc for tc in state_snapshot.values.get("test_cases", [])}
+    except Exception as e:
+        logger.warning(f"[BULK_REVIEW] Failed to fetch checkpoint details: {e}")
+
+    chroma_client = None
+    defects_vector_col = None
+    try:
+        chroma_client = get_chroma_client()
+        defects_vector_col = chroma_client.get_or_create_collection("defects")
+    except Exception as ex:
+        logger.warning(f"[BULK_REVIEW] Vector collection access skipped: {ex}")
+
+    approved_count = 0
+    created_defects: List[str] = []
+
+    for finding in pending_findings:
+        fid = finding["_id"]
+        tc_id = finding.get("test_case_id", "")
+        tc = tc_map.get(tc_id, {})
+        tc_name = tc.get("name", "Unknown Test Case")
+        op_id = tc.get("endpoint_operation_id", "unknown_operation")
+
+        await finding_repo.update(fid, {
+            "guardrail_status": "approved",
+            "reviewer": payload.reviewer,
+            "review_notes": payload.notes,
+            "reviewed_at": current_utc_iso()
+        })
+
+        defect_id = f"def_{uuid.uuid4().hex[:8]}"
+        defect_doc = {
+            "_id": defect_id,
+            "run_id": run_id,
+            "spec_id": spec_id,
+            "test_case_id": tc_id,
+            "finding_id": fid,
+            "severity": finding.get("severity", "high"),
+            "confidence": finding.get("confidence", 0.9),
+            "status": "open",
+            "title": f"Defect in {tc_name} ({op_id})",
+            "root_cause_summary": finding.get("root_cause_summary", ""),
+            "suggested_fix": finding.get("suggested_fix", ""),
+            "supporting_evidence": finding.get("supporting_evidence", []),
+            "external_ref": None,
+            "created_at": current_utc_iso()
+        }
+        await defect_repo.insert_defect(defect_doc)
+        created_defects.append(defect_id)
+
+        if defects_vector_col and finding.get("root_cause_summary"):
+            try:
+                embed_res = await EmbeddingTool.embed(finding["root_cause_summary"])
+                if embed_res.success and embed_res.data:
+                    defects_vector_col.upsert(
+                        ids=[defect_id],
+                        documents=[finding["root_cause_summary"]],
+                        embeddings=[embed_res.data]
+                    )
+            except Exception as ex:
+                logger.debug(f"[BULK_REVIEW] Vector index skipped for defect {defect_id}: {ex}")
+
+        approved_count += 1
+
+    # Resume graph execution
+    logger.info(f"[BULK_REVIEW] Bulk-approved {approved_count} findings for run '{run_id}'. Resuming execution graph...")
+    checkpointer = MongoCheckpointSaver(db=db)
+    graph = build_graph(checkpointer=checkpointer)
+    config = {"configurable": {"thread_id": run_id}}
+
+    from langgraph.types import Command
+    graph_res = await graph.ainvoke(
+        Command(resume={"reviewed_by": payload.reviewer, "decision": "approve", "bulk": True}),
+        config=config
+    )
+
+    final_status = "completed" if (graph_res and ("final_report" in graph_res or graph_res.get("status") == "completed")) else (graph_res.get("status") if graph_res else "completed")
+    update_data: Dict[str, Any] = {
+        "endpoints": graph_res.get("endpoints", []) if graph_res else [],
+        "test_plan": graph_res.get("test_plan", {}) if graph_res else {},
+        "errors": graph_res.get("errors", []) if graph_res else [],
+        "updated_at": current_utc_iso(),
+    }
+    if graph_res and "test_case_executions" in graph_res:
+        update_data["test_case_executions"] = graph_res["test_case_executions"]
+    if graph_res and "final_report" in graph_res:
+        update_data["final_report"] = graph_res["final_report"]
+
+    await run_repo.update_status(run_id, final_status, update_data)
+    from app.database import save_mock_db_to_disk
+    await save_mock_db_to_disk()
+
+    return {
+        "run_id": run_id,
+        "approved_count": approved_count,
+        "created_defects": created_defects,
+        "run_resumed": True,
+        "status": final_status
+    }
+

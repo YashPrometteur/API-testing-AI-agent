@@ -1,5 +1,6 @@
 import logging
-from typing import Any, Dict, List
+import os
+from typing import Any, Dict, List, Optional
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 
@@ -18,7 +19,7 @@ class ReportSummary(BaseModel):
     summary_text: str = Field(description="A clean, executive-level narrative paragraph summarizing the API test run results.")
 
 
-async def reporting_agent_node(state: TestRunState) -> Dict[str, Any]:
+async def reporting_agent_node(state: TestRunState, db_override: Optional[Any] = None) -> Dict[str, Any]:
     """Reporting Agent: Summarizes executions, updates history metrics, calls LLM for summary, and renders HTML/PDF."""
     logger.info("[REPORTING_AGENT] Starting report generation...")
 
@@ -28,8 +29,11 @@ async def reporting_agent_node(state: TestRunState) -> Dict[str, Any]:
     test_cases_list = state.get("test_cases", [])
     test_cases = {tc["id"]: tc for tc in test_cases_list}
 
-    from app.database import get_mongo_db
-    db = await get_mongo_db()
+    if db_override is not None:
+        db = db_override
+    else:
+        from app.database import get_mongo_db
+        db = await get_mongo_db()
     history_repo = ExecutionHistoryRepository(db)
 
     # 1. Load run document to get spec_id and current run status
@@ -88,6 +92,7 @@ async def reporting_agent_node(state: TestRunState) -> Dict[str, Any]:
     pass_count = 0
     fail_count = 0
     flaky_count = 0
+    not_executed_count = 0
 
     categories_metrics: Dict[str, Dict[str, int]] = {}
     endpoint_run_metrics: Dict[str, Dict[str, int]] = {}
@@ -100,10 +105,10 @@ async def reporting_agent_node(state: TestRunState) -> Dict[str, Any]:
 
         # Init category dict
         if category not in categories_metrics:
-            categories_metrics[category] = {"pass_count": 0, "fail_count": 0, "flaky_count": 0}
+            categories_metrics[category] = {"pass_count": 0, "fail_count": 0, "flaky_count": 0, "not_executed_count": 0}
         # Init endpoint dict
         if op_id not in endpoint_run_metrics:
-            endpoint_run_metrics[op_id] = {"pass_count": 0, "fail_count": 0, "flaky_count": 0, "total_executions": 0}
+            endpoint_run_metrics[op_id] = {"pass_count": 0, "fail_count": 0, "flaky_count": 0, "not_executed_count": 0, "total_executions": 0}
 
         status = res.get("status", "fail")
         endpoint_run_metrics[op_id]["total_executions"] += 1
@@ -116,6 +121,10 @@ async def reporting_agent_node(state: TestRunState) -> Dict[str, Any]:
             flaky_count += 1
             categories_metrics[category]["flaky_count"] += 1
             endpoint_run_metrics[op_id]["flaky_count"] += 1
+        elif status == "not_executed":
+            not_executed_count += 1
+            categories_metrics[category]["not_executed_count"] += 1
+            endpoint_run_metrics[op_id]["not_executed_count"] += 1
         else:  # fail or error
             fail_count += 1
             categories_metrics[category]["fail_count"] += 1
@@ -180,20 +189,78 @@ async def reporting_agent_node(state: TestRunState) -> Dict[str, Any]:
                 break
             except Exception as e:
                 logger.warning(f"[REPORTING_AGENT] Executive summary LLM call failed (attempt {attempt + 1}/2): {e}")
-                if attempt == 1:
-                    logger.warning("[REPORTING_AGENT] LLM executive summary failed permanently. Proceeding with empty summary.")
 
-    # 4. Construct JSON Report (deduplicating findings by ID if present)
+        # Deterministic fallback summary if LLM summary failed or returned empty
+        if not summary_text:
+            flaky_str = f" Flaky endpoints identified: {', '.join(flaky_endpoints)}." if flaky_endpoints else ""
+            summary_text = (
+                f"Automated test execution completed for run '{run_id}'. "
+                f"Out of {total_executions} total test cases executed across {len(endpoint_run_metrics)} operations, "
+                f"{pass_count} passed, {fail_count} failed, and {flaky_count} exhibited flakiness, "
+                f"yielding an overall pass rate of {pass_rate * 100:.1f}%.{flaky_str}"
+            )
+
+    # 4. Construct JSON Report (suppressing resolved findings for test cases whose final attempt succeeded)
+    final_success_tc_ids = set()
+    for res in execution_results:
+        if not isinstance(res, dict):
+            continue
+        tc_id = res.get("test_case_id")
+        if not tc_id:
+            continue
+        stat = res.get("status")
+        hist = res.get("history") or []
+        last_hist_stat = hist[-1].get("status") if hist else None
+
+        if stat == "pass":
+            final_success_tc_ids.add(tc_id)
+        elif stat == "flaky" and last_hist_stat == "PASS":
+            final_success_tc_ids.add(tc_id)
+        elif not res.get("assertion_failures") and res.get("actual_status_code") in (200, 201, 204):
+            final_success_tc_ids.add(tc_id)
+
+    active_findings = []
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        tc_id = f.get("test_case_id")
+        if tc_id and tc_id in final_success_tc_ids:
+            logger.info(
+                f"[REPORTING_AGENT] Suppressing resolved finding '{f.get('id')}' for test case '{tc_id}' "
+                f"whose final attempt succeeded."
+            )
+            continue
+        active_findings.append(f)
+
     unique_findings = []
     seen_ids = set()
-    for f in findings:
-        if isinstance(f, dict) and f.get("id"):
-            fid = f["id"]
+    for f in active_findings:
+        fid = f.get("id") or f.get("_id")
+        if fid:
             if fid not in seen_ids:
                 seen_ids.add(fid)
                 unique_findings.append(f)
         else:
             unique_findings.append(f)
+
+    endpoints_list = state.get("endpoints", [])
+    ep_map = {ep.get("operation_id"): ep for ep in endpoints_list if isinstance(ep, dict) and ep.get("operation_id")}
+
+    endpoints_summary: Dict[str, Dict[str, Any]] = {}
+    for op_id, m in endpoint_run_metrics.items():
+        ep = ep_map.get(op_id, {})
+        tot = m.get("total_executions", 0)
+        p_count = m.get("pass_count", 0)
+        p_rate = (p_count / tot) if tot > 0 else 1.0
+        endpoints_summary[op_id] = {
+            "method": (ep.get("method") or "GET").upper(),
+            "path": ep.get("path") or "/",
+            "pass_count": p_count,
+            "fail_count": m.get("fail_count", 0),
+            "flaky_count": m.get("flaky_count", 0),
+            "not_executed_count": m.get("not_executed_count", 0),
+            "pass_rate": round(p_rate, 4)
+        }
 
     report_dict = {
         "run_id": run_id,
@@ -203,7 +270,9 @@ async def reporting_agent_node(state: TestRunState) -> Dict[str, Any]:
             "pass_count": pass_count,
             "fail_count": fail_count,
             "flaky_count": flaky_count,
+            "not_executed_count": not_executed_count if 'not_executed_count' in locals() else 0,
             "pass_rate": pass_rate,
+            "endpoints": endpoints_summary,
             "categories": categories_metrics,
             "severity_findings": severity_findings,
             "flaky_endpoints_detected": flaky_endpoints,
@@ -218,16 +287,19 @@ async def reporting_agent_node(state: TestRunState) -> Dict[str, Any]:
     endpoints_list = state.get("endpoints", [])
     ep_map = {ep.get("operation_id"): ep for ep in endpoints_list if isinstance(ep, dict) and ep.get("operation_id")}
     execution_results_map = {res["test_case_id"]: res for res in execution_results if isinstance(res, dict) and res.get("test_case_id")}
-    findings_map = {f.get("test_case_id"): f for f in findings if isinstance(f, dict) and f.get("test_case_id")}
+    findings_map = {f.get("test_case_id"): f for f in active_findings if isinstance(f, dict) and f.get("test_case_id")}
     retry_counts = state.get("retry_counts", {})
 
     priority_weight = {"critical": 1, "high": 2, "medium": 3, "low": 4}
 
-    unique_persisted_ops = set(tc.get("endpoint_operation_id") for tc in test_cases_list if isinstance(tc, dict))
-    logger.info(f"[REPORTING_AGENT] Assembling {len(test_cases_list)} test_case_executions for operations: {list(unique_persisted_ops)}")
+    from app.agents.execution.execution_planner import sort_test_cases_by_dependency
+    sorted_report_tcs = sort_test_cases_by_dependency([tc for tc in test_cases_list if isinstance(tc, dict)])
+
+    unique_persisted_ops = set(tc.get("endpoint_operation_id") for tc in sorted_report_tcs if isinstance(tc, dict))
+    logger.info(f"[REPORTING_AGENT] Assembling {len(sorted_report_tcs)} test_case_executions for operations: {list(unique_persisted_ops)}")
 
     test_case_executions: List[Dict[str, Any]] = []
-    for tc in test_cases_list:
+    for tc in sorted_report_tcs:
         if not isinstance(tc, dict):
             continue
         tc_id = tc.get("id", "")
@@ -290,27 +362,45 @@ async def reporting_agent_node(state: TestRunState) -> Dict[str, Any]:
                 "failure_reason": failure_reason
             }
 
-        finding_info = findings_map.get(tc_id)
-        if isinstance(finding_info, dict):
-            # Preserve all fields in finding (rationale, root_cause_summary, suggested_fix, supporting_evidence, etc.)
-            finding_info = {**finding_info}
-
-        # Build retry history if retries occurred
-        history = []
-        tc_retries = retry_counts.get(tc_id, 0)
-        attempt_cnt = exec_res.get("attempt_count", 1) if exec_res else 1
-        if tc_retries > 0 or attempt_cnt > 1:
-            if exec_res and exec_res.get("history"):
-                history = exec_res["history"]
+        # Build retry history from actual recorded attempts
+        history = list(exec_res.get("history") or []) if exec_res else []
+        if not history and exec_res:
+            attempts_cnt = int(exec_res.get("attempt_count", 1))
+            if attempts_cnt > 1:
+                history = [
+                    {
+                        "attempt": i + 1,
+                        "status": "FAIL" if i < attempts_cnt - 1 else execution_status_str,
+                        "status_code": exec_res.get("actual_status_code"),
+                        "latency_ms": float(exec_res.get("latency_ms", 0.0)),
+                        "assertion_failures": list(exec_res.get("assertion_failures") or []),
+                        "executed_at": exec_res.get("executed_at") or current_utc_iso()
+                    }
+                    for i in range(attempts_cnt)
+                ]
             else:
-                for att in range(1, attempt_cnt + 1):
-                    if execution_status_str == "PASS":
-                        att_status = "PASS"
-                    elif execution_status_str == "FLAKY":
-                        att_status = "FAIL" if att < attempt_cnt else "PASS"
-                    else:
-                        att_status = execution_status_str
-                    history.append({"attempt": att, "status": att_status})
+                history = [{
+                    "attempt": 1,
+                    "status": execution_status_str,
+                    "status_code": exec_res.get("actual_status_code"),
+                    "latency_ms": float(exec_res.get("latency_ms", 0.0)),
+                    "assertion_failures": list(exec_res.get("assertion_failures") or []),
+                    "executed_at": exec_res.get("executed_at") or current_utc_iso()
+                }]
+
+        # Bug 2 fix: If only 1 attempt exists in history, status CANNOT be FLAKY
+        if len(history) <= 1 and execution_status_str == "FLAKY":
+            single_stat = history[0]["status"] if history else "PASS"
+            execution_status_str = single_stat.upper()
+            if exec_entry:
+                exec_entry["status"] = execution_status_str.lower()
+
+        # Bug 1 fix: A test case whose final attempt succeeded must NEVER carry an attached defect finding
+        finding_info = None
+        if execution_status_str != "PASS" and tc_id not in final_success_tc_ids:
+            raw_finding = findings_map.get(tc_id)
+            if isinstance(raw_finding, dict):
+                finding_info = {**raw_finding}
 
         entry_record = {
             "test_case_id": tc_id,
@@ -324,24 +414,37 @@ async def reporting_agent_node(state: TestRunState) -> Dict[str, Any]:
             "priority": priority,
             "test_case": tc_entry,
             "execution_result": exec_entry,
-            "finding": finding_info
+            "finding": finding_info,
+            "history": history
         }
-
-        if history:
-            entry_record["history"] = history
 
         test_case_executions.append(entry_record)
 
-    # Sort test_case_executions deterministically: Category -> Endpoint -> Priority -> Test Case Name
+    # Sort test_case_executions deterministically: Category Track (Functional -> Negative) -> Onboarding Sequence -> Endpoint -> Priority -> Name
+    category_rank = {
+        "functional": 0,
+        "negative": 1,
+        "edge_case": 2,
+        "security": 3,
+        "auth": 4,
+        "authz": 5,
+        "regression": 6
+    }
+    from app.agents.execution.execution_planner import get_onboarding_step_rank
     test_case_executions.sort(
         key=lambda x: (
-            x["category"],
-            x["endpoint"],
-            priority_weight.get(x["priority"], 99),
-            x["test_case"].get("name", ""),
-            x["test_case_id"]
+            category_rank.get(str(x.get("category", "")).lower(), 99),
+            get_onboarding_step_rank(x.get("test_case", {})),
+            x.get("endpoint", ""),
+            priority_weight.get(x.get("priority"), 99),
+            x.get("test_case", {}).get("name", ""),
+            x.get("test_case_id", "")
         )
     )
+
+    # Attach full per-API executions to report_dict (Item 7)
+    report_dict["test_case_executions"] = test_case_executions
+    report_dict["generation_errors"] = state.get("generation_errors", [])
 
     # 6. Render HTML and PDF (with fallback handling)
     html_content = ""
@@ -349,6 +452,15 @@ async def reporting_agent_node(state: TestRunState) -> Dict[str, Any]:
 
     try:
         html_content = ReportRendererTool.render_html(report_dict)
+        if html_content:
+            os.makedirs("reports", exist_ok=True)
+            report_file_path = os.path.join("reports", f"report_{run_id}.html")
+            with open(report_file_path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+            latest_file_path = os.path.join("reports", "latest_report.html")
+            with open(latest_file_path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+            logger.info(f"[REPORTING_AGENT] Saved HTML visual report to '{report_file_path}' and '{latest_file_path}'.")
     except Exception as e:
         logger.warning(f"[REPORTING_AGENT] Report HTML rendering failed: {e}. Falling back to empty HTML.")
 

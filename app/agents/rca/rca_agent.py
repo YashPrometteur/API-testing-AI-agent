@@ -51,12 +51,16 @@ def normalize_severity(
 ) -> str:
     """
     Deterministic rule engine to normalize LLM-assigned severity:
+    - Server crashes (>= 500) always receive 'high' (or 'critical') severity.
     - 4xx status mismatches on non-security categories (functional, negative, edge_case)
       such as expected 400, actual 404/405/415 are normalized to 'medium'.
-    - Server crashes (>= 500) and security categories retain 'high' or 'critical'.
+    - Security categories retain 'high' or 'critical'.
     """
     sev = (proposed_severity or "medium").lower()
     cat = (category or "").lower()
+
+    if actual_status_code and actual_status_code >= 500:
+        return "critical" if sev == "critical" else "high"
 
     if actual_status_code and 400 <= actual_status_code < 500:
         if cat in ("functional", "negative", "edge_case", "regression"):
@@ -164,28 +168,23 @@ async def rca_node(state: TestRunState) -> Dict[str, Any]:
             f"- Request Body: {tc.get('request', {}).get('body')}\n\n"
             f"### Actual Response details\n"
             f"- Status Code: {actual_code}\n"
-            f"- Response Body: {actual_body}\n"
-            f"- Assertion Failures: {failures}\n\n"
+            f"- Response Body: {str(actual_body)[:400] if actual_body else 'None'}\n"
+            f"- Assertion Failures: {str(failures)[:300] if failures else '[]'}\n\n"
             f"### Retrieved Context:\n"
-            f"{context_str}\n"
+            f"{context_str[:600]}\n"
         )
 
         diagnosis = None
-        # Try structured generation with 1 re-prompt on validation failure
-        for attempt in range(2):
-            try:
-                diagnosis = await llm_client.generate_structured(
-                    prompt=prompt,
-                    response_model=RCADiagnosis,
-                    system_prompt=system_prompt,
-                    temperature=0.1
-                )
-                break
-            except Exception as e:
-                logger.warning(f"[RCA_AGENT] Structured output attempt {attempt + 1} failed for {tc_id}: {e}")
-                if attempt == 0:
-                    prompt += f"\n\nCorrection Note: Previous attempt failed validation. Please adhere strictly to the JSON schema output format."
-                    await asyncio.sleep(1)
+        # Try structured generation (fails fast to deterministic QA diagnosis on exhaustion/error)
+        try:
+            diagnosis = await llm_client.generate_structured(
+                prompt=prompt,
+                response_model=RCADiagnosis,
+                system_prompt=system_prompt,
+                temperature=0.1
+            )
+        except Exception as e:
+            logger.warning(f"[RCA_AGENT] Structured output failed for {tc_id}: {e}. Using deterministic QA diagnosis.")
 
         # Build Finding entry (fails closed/safe)
         expected_code = tc.get("expected", {}).get("status_code") if isinstance(tc.get("expected"), dict) else None
@@ -221,7 +220,16 @@ async def rca_node(state: TestRunState) -> Dict[str, Any]:
             api_msg_clean = api_msg.strip()
             msg_lower = api_msg_clean.lower()
 
-            if "already exists" in msg_lower:
+            if "datetime.date" in msg_lower or "cannot encode object" in msg_lower:
+                rc_summary = f"MongoDB BSON Serialization Defect (HTTP 500): The backend crashed with '{api_msg_clean}' because Python's datetime.date object is incompatible with MongoDB's BSON serializer."
+                sug_fix = "In the backend user registration service, convert datetime.date to datetime.datetime (e.g. datetime.combine(dob, datetime.min.time())) or ISO 8601 string before persisting to MongoDB."
+            elif actual_code == 500:
+                rc_summary = f"Unhandled Backend Type-Casting / Server Defect (HTTP 500): The backend crashed with '{api_msg_clean or 'Internal Server Error'}' instead of safely returning HTTP 422 Unprocessable Entity."
+                sug_fix = f"Implement strict Pydantic/FastAPI input type validation and type coercion in `{tc.get('endpoint_operation_id', 'endpoint')}` to gracefully reject invalid data types with HTTP 422 before internal business logic / database querying."
+            elif "authentication flow" in msg_lower or "invalid or expired session" in msg_lower:
+                rc_summary = f"Session State Machine Rejection (HTTP 400): The backend returned '{api_msg_clean}' because the session_id was unverified, expired, or invalid."
+                sug_fix = "Execute the prerequisite OTP request & verification flow to generate an active verified session_id before submitting registration details."
+            elif "already exists" in msg_lower:
                 rc_summary = f"Conflict constraint violation: The API returned HTTP {actual_code} ('{api_msg_clean}') because an active resource already exists."
                 sug_fix = "Deactivate existing active plans of the same duration before activating a new plan, or adjust business logic to allow multiple active plans."
             elif "not found" in msg_lower:

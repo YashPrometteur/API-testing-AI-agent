@@ -34,17 +34,11 @@ class HTTPExecutionTool:
         if status_code is None:
             return True
 
-        # 5xx and 429 are transient server/network issues
-        if status_code >= 500 or status_code == 429:
+        # 429 Rate Limit, 503 Service Unavailable, and 504 Gateway Timeout are transient network/infra issues
+        if status_code in (429, 503, 504):
             return True
 
-        # 4xx response matching expected outcome (e.g. expected 400/401/403/404) is NOT a transient failure
-        if 400 <= status_code < 500:
-            if expected_status_code is not None and status_code == expected_status_code:
-                return False
-            # Unexpected 4xx is a functional defect, not a transient network failure
-            return False
-
+        # HTTP 500, 502 or 4xx responses are deterministic server/client responses (not transient network drops)
         return False
 
     @classmethod
@@ -55,21 +49,33 @@ class HTTPExecutionTool:
         headers: Optional[Dict[str, str]] = None,
         query_params: Optional[Dict[str, Any]] = None,
         body: Optional[Any] = None,
+        files: Optional[Any] = None,
         expected_status_code: Optional[int] = None,
         timeout: float = 10.0,
         max_retries: int = 3,
         client: Optional[httpx.AsyncClient] = None
     ) -> ToolResult:
         """Execute an HTTP request with exponential backoff retries for transient errors."""
-        headers = headers or {}
+        headers = dict(headers) if headers else {}
         query_params = query_params or {}
 
         # Prepare request body
         json_body = None
+        data_body = None
         content_body = None
+        files_body = files
 
-        if body is not None:
-            if isinstance(body, (dict, list)):
+        content_type = headers.get("Content-Type", "").lower()
+
+        if files_body is not None:
+            # Let httpx calculate multipart boundary automatically
+            headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+            if isinstance(body, dict):
+                data_body = body
+        elif body is not None:
+            if "x-www-form-urlencoded" in content_type:
+                data_body = body
+            elif isinstance(body, (dict, list)):
                 json_body = body
             elif isinstance(body, str):
                 content_body = body.encode("utf-8")
@@ -91,7 +97,9 @@ class HTTPExecutionTool:
                 headers=headers,
                 params=query_params,
                 json=json_body,
+                data=data_body,
                 content=content_body,
+                files=files_body,
                 timeout=timeout
             )
             try:

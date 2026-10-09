@@ -18,8 +18,10 @@ app.add_middleware(LoggingMiddleware)
 app.include_router(specs.router, prefix="/api/v1")
 app.include_router(runs.router, prefix="/api/v1")
 app.include_router(defects.router, prefix="/api/v1")
-app.include_router(reports.router, prefix="/api/v1")
-app.include_router(reviews.router, prefix="/api/v1")
+app.include_router(reports.router, prefix="/api/v1/reports")
+app.include_router(reports.router, prefix="/api/v1/runs")
+app.include_router(reviews.router, prefix="/api/v1/reviews")
+app.include_router(reviews.router, prefix="/api/v1/defects")
 app.include_router(websocket.router, prefix="/api/v1")
 
 

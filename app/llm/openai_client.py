@@ -57,6 +57,9 @@ class OpenAIClient:
                 return parsed
             except (RateLimitError, APIConnectionError, APIError) as e:
                 last_exception = e
+                err_str = str(e).lower()
+                if "insufficient_quota" in err_str or "credit_balance_exhausted" in err_str:
+                    raise e
                 if attempt < 2:
                     delay = delays[attempt]
                     logger.warning(f"OpenAI API transport error (attempt {attempt + 1}/3): {e}. Retrying in {delay}s...")

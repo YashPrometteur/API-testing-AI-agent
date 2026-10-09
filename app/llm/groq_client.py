@@ -13,22 +13,37 @@ except ImportError:
     APIConnectionError = Exception
 
 from app.config.settings import settings
+from app.llm.rate_limiter import global_rate_limiter
 
 T = TypeVar("T", bound=BaseModel)
 logger = logging.getLogger("groq_client")
 
 
-# Shared module-level concurrency semaphore to limit concurrent active Groq requests across all agent tasks
-_groq_semaphore = asyncio.Semaphore(3)
+AVAILABLE_GROQ_MODELS = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b"
+]
 
 
 class GroqClient:
-    """Groq client implementation using OpenAI-compatible structured outputs / JSON mode with rate-limit resilience."""
+    """Groq client implementation using OpenAI-compatible structured outputs / JSON mode with 3-model 600k token pool resilience."""
+
+    # Class-level current model index so failovers persist across generator calls
+    _shared_model_idx: int = 0
+    _exhausted_models_until: dict = {}
 
     def __init__(self, api_key: str = None, model: str = None):
         self.api_key = api_key or settings.GROQ_API_KEY
-        self.model = model or settings.GROQ_MODEL
-        self.client = AsyncGroq(api_key=self.api_key) if self.api_key else None
+        configured_model = model or settings.GROQ_MODEL
+        # Build priority pool: configured model first, followed by remaining models
+        pool = [configured_model] if configured_model else []
+        for m in AVAILABLE_GROQ_MODELS:
+            if m not in pool:
+                pool.append(m)
+        self.models_pool = pool
+        self.model = self.models_pool[GroqClient._shared_model_idx % len(self.models_pool)]
+        self.client = AsyncGroq(api_key=self.api_key, max_retries=0) if self.api_key else None
 
     async def generate_structured(
         self,
@@ -37,6 +52,7 @@ class GroqClient:
         system_prompt: str = "",
         temperature: float = 0.2
     ) -> T:
+        import time
         if not self.api_key:
             raise RuntimeError("GROQ_API_KEY is not configured in settings or environment.")
 
@@ -53,84 +69,205 @@ class GroqClient:
             {"role": "user", "content": prompt}
         ]
 
-        max_attempts = 4
         last_exception = None
+        pool_len = len(self.models_pool)
 
-        for attempt in range(1, max_attempts + 1):
-            try:
-                # Throttling concurrent active API requests using shared semaphore
-                async with _groq_semaphore:
-                    response = await self.client.chat.completions.create(
-                        model=self.model,
-                        messages=messages,
-                        response_format={"type": "json_object"},
-                        temperature=temperature,
-                    )
-                raw_text = response.choices[0].message.content or ""
-                # Strip triple backticks if present
-                raw_text_clean = raw_text.strip()
-                if raw_text_clean.startswith("```json"):
-                    raw_text_clean = raw_text_clean[7:]
-                if raw_text_clean.startswith("```"):
-                    raw_text_clean = raw_text_clean[3:]
-                if raw_text_clean.endswith("```"):
-                    raw_text_clean = raw_text_clean[:-3]
-                raw_text_clean = raw_text_clean.strip()
+        for model_turn in range(pool_len):
+            current_model = self.models_pool[GroqClient._shared_model_idx % pool_len]
+            self.model = current_model
 
-                return response_model.model_validate_json(raw_text_clean)
-            except (RateLimitError, APIConnectionError, APIError) as e:
-                last_exception = e
-                status_code = getattr(e, "status_code", None)
-                headers = {}
-                if hasattr(e, "response") and e.response is not None:
-                    if not status_code:
-                        status_code = getattr(e.response, "status_code", None)
-                    headers = getattr(e.response, "headers", {}) or {}
+            # Skip models that are known to be in daily quota cooldown
+            now = time.time()
+            if now < GroqClient._exhausted_models_until.get(current_model, 0):
+                GroqClient._shared_model_idx = (GroqClient._shared_model_idx + 1) % pool_len
+                continue
 
-                status_code = status_code or (429 if isinstance(e, RateLimitError) else 500)
-                req_id = headers.get("x-request-id", "unknown_req_id")
+            model_exhausted = False
+            max_attempts = 5
 
-                if attempt < max_attempts:
-                    # Check for Retry-After or reset headers from Groq API
-                    retry_after_header = headers.get("retry-after") or headers.get("x-ratelimit-reset-requests")
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    # Pacing & Concurrency Queuing via global rate limiter
+                    await global_rate_limiter.acquire()
+                    try:
+                        response = await self.client.chat.completions.create(
+                            model=self.model,
+                            messages=messages,
+                            response_format={"type": "json_object"},
+                            temperature=temperature,
+                        )
+                    finally:
+                        global_rate_limiter.release()
+                    raw_text = response.choices[0].message.content or ""
+                    logger.info(f"[GROQ_CLIENT] Raw response received ({len(raw_text)} chars) from {self.model}: {raw_text[:250]}...")
+                    
+                    # Robust extraction of JSON from raw response
+                    raw_text_clean = raw_text.strip()
+                    if "```" in raw_text_clean:
+                        import re
+                        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw_text_clean)
+                        if match:
+                            raw_text_clean = match.group(1).strip()
+                    
+                    # Parse with json first to normalize any wrapper irregularities
+                    try:
+                        parsed_json = json.loads(raw_text_clean)
+                        if isinstance(parsed_json, list):
+                            parsed_json = {"test_cases": parsed_json}
+                        elif isinstance(parsed_json, dict):
+                            if "test_cases" not in parsed_json:
+                                for alt_key in ["cases", "testCases", "test_case_list", "tests", "data"]:
+                                    if alt_key in parsed_json and isinstance(parsed_json[alt_key], list):
+                                        parsed_json["test_cases"] = parsed_json.pop(alt_key)
+                                        break
+                        return response_model.model_validate(parsed_json)
+                    except Exception as parse_err:
+                        logger.error(f"[GROQ_CLIENT] JSON/Schema Validation Error: {parse_err}\n[RAW LLM RESPONSE WAS]:\n{raw_text}")
+                        raise parse_err
+                except (RateLimitError, APIConnectionError, APIError) as e:
+                    last_exception = e
+                    status_code = getattr(e, "status_code", None)
+                    headers = {}
+                    if hasattr(e, "response") and e.response is not None:
+                        if not status_code:
+                            status_code = getattr(e.response, "status_code", None)
+                        headers = getattr(e.response, "headers", {}) or {}
+
+                    status_code = status_code or (429 if isinstance(e, RateLimitError) else 500)
+                    req_id = headers.get("x-request-id", "unknown_req_id")
+                    err_str = str(e)
+
+                    # 1. First priority: Parse exact retry delay from Groq's error message (e.g. 'Please try again in 14.2s')
                     delay = None
-                    if retry_after_header:
-                        try:
-                            # Try parsing numerical seconds
-                            delay = float(retry_after_header) + random.uniform(0.1, 0.5)
-                        except (ValueError, TypeError):
-                            pass
+                    import re
+                    m_sec = re.search(r'try again in (?:(\d+)m\s*)?([\d\.]+)s', err_str, re.IGNORECASE)
+                    if m_sec:
+                        mins = float(m_sec.group(1) or 0)
+                        secs = float(m_sec.group(2) or 0)
+                        delay = (mins * 60.0) + secs + 0.5
+                    else:
+                        m_ms = re.search(r'try again in ([\d\.]+)ms', err_str, re.IGNORECASE)
+                        if m_ms:
+                            delay = (float(m_ms.group(1)) / 1000.0) + 0.2
+
+                    # 2. Second priority: retry-after or reset headers from Groq API
+                    if delay is None:
+                        retry_after_header = headers.get("retry-after")
+                        if retry_after_header:
+                            try:
+                                delay = float(retry_after_header) + random.uniform(0.2, 0.6)
+                            except (ValueError, TypeError):
+                                pass
 
                     if delay is None:
-                        # Exponential backoff with randomized jitter: 2^attempt + jitter
+                        reset_tokens = headers.get("x-ratelimit-reset-tokens")
+                        if reset_tokens:
+                            try:
+                                if reset_tokens.endswith("ms"):
+                                    delay = (float(reset_tokens[:-2]) / 1000.0) + random.uniform(0.2, 0.5)
+                                elif reset_tokens.endswith("s"):
+                                    delay = float(reset_tokens[:-1]) + random.uniform(0.2, 0.6)
+                            except (ValueError, TypeError):
+                                pass
+
+                    # 3. Fallback: exponential backoff
+                    if delay is None:
                         base_delay = 2.0 ** attempt
-                        delay = base_delay + random.uniform(0.2, 1.2)
+                        delay = base_delay + random.uniform(0.5, 1.5)
 
-                    if delay > 10.0:
+                    # Notify global rate limiter to pause other waiting coroutines
+                    global_rate_limiter.notify_rate_limit(delay)
+
+                    is_daily = delay > 30.0 or "tokens per day" in err_str.lower() or "tpd" in err_str.lower()
+                    if is_daily:
                         logger.warning(
-                            f"[GROQ_CLIENT] Excessive rate limit delay requested ({delay:.1f}s > 10s max). "
-                            f"Failing request immediately to trigger fast baseline generator fallback."
+                            f"[GROQ_CLIENT] Model '{current_model}' daily quota reached ({delay:.1f}s delay requested). "
+                            f"Seamlessly failing over to next model in 600k token pool..."
                         )
-                        raise e
+                        GroqClient._exhausted_models_until[current_model] = now + max(delay, 600.0)
+                        model_exhausted = True
+                        break
 
-                    logger.warning(
-                        f"[GROQ_CLIENT] Transport / Rate Limit Error (status={status_code}, attempt={attempt}/{max_attempts}, "
-                        f"req_id='{req_id}'). Model='{self.model}'. Error='{e}'. Retrying in {delay:.2f}s..."
-                    )
-                    await asyncio.sleep(delay)
-                else:
-                    logger.error(
-                        f"[GROQ_CLIENT] Exhausted all {max_attempts} retries for Groq API (status={status_code}, req_id='{req_id}'). "
-                        f"Error: {e}"
-                    )
+                    if attempt < 2 and delay <= 3.0:
+                        logger.warning(
+                            f"[GROQ_CLIENT] Rate Limit / Transport pause on model '{self.model}' (attempt={attempt}/2, "
+                            f"status={status_code}). Sleeping {delay:.2f}s for sliding token window to refresh..."
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.warning(
+                            f"[GROQ_CLIENT] Model '{current_model}' paused ({delay:.1f}s delay requested). "
+                            f"Rotating immediately to next provider/model in pool..."
+                        )
+                        GroqClient._exhausted_models_until[current_model] = now + max(delay, 30.0)
+                        model_exhausted = True
+                        break
+                except ValidationError as e:
+                    # Let ValidationError bubble up for structured_output re-prompt handling
                     raise e
-            except ValidationError as e:
-                # Let ValidationError bubble up for structured_output re-prompt handling
-                raise e
-            except Exception as e:
-                raise e
+                except Exception as e:
+                    raise e
 
-        raise last_exception or RuntimeError("Failed to generate structured output from Groq.")
+            if model_exhausted:
+                GroqClient._shared_model_idx = (GroqClient._shared_model_idx + 1) % pool_len
+                next_model = self.models_pool[GroqClient._shared_model_idx]
+                logger.warning(
+                    f"[GROQ_CLIENT] Seamlessly switched active model to '{next_model}' "
+                    f"({GroqClient._shared_model_idx + 1}/{pool_len} in 600k token pool). Continuing mid-run..."
+                )
+                continue
+
+        # Tier 2 Safety Net: Seamless failover to OpenAI (gpt-4o-mini)
+        now = time.time()
+        if settings.OPENAI_API_KEY and now >= GroqClient._exhausted_models_until.get("openai", 0):
+            try:
+                logger.warning("[GROQ_CLIENT -> FAILOVER] Groq models exhausted. Failing over to OpenAI (gpt-4o-mini)...")
+                from app.llm.openai_client import OpenAIClient
+                openai_client = OpenAIClient(model="gpt-4o-mini")
+                return await openai_client.generate_structured(
+                    prompt=prompt,
+                    response_model=response_model,
+                    system_prompt=system_prompt,
+                    temperature=temperature
+                )
+            except Exception as openai_err:
+                logger.warning(f"[GROQ_CLIENT -> FAILOVER] OpenAI fallback unavailable ({openai_err}). Trying OpenRouter...")
+                GroqClient._exhausted_models_until["openai"] = now + 600.0
+
+        # Tier 3 Safety Net: Seamless failover to OpenRouter Cloud
+        if settings.OPENROUTER_API_KEY and now >= GroqClient._exhausted_models_until.get("openrouter", 0):
+            try:
+                logger.warning("[GROQ_CLIENT -> FAILOVER] Failing over to OpenRouter Cloud...")
+                from app.llm.openrouter_client import OpenRouterClient
+                openrouter_client = OpenRouterClient()
+                return await openrouter_client.generate_structured(
+                    prompt=prompt,
+                    response_model=response_model,
+                    system_prompt=system_prompt,
+                    temperature=temperature
+                )
+            except Exception as openrouter_err:
+                logger.warning(f"[GROQ_CLIENT -> FAILOVER] OpenRouter fallback unavailable ({openrouter_err}). Trying local Ollama...")
+                GroqClient._exhausted_models_until["openrouter"] = now + 600.0
+
+        # Tier 4 Hybrid Safety Net: Seamless failover to local Ollama (qwen2.5:7b)
+        if now >= GroqClient._exhausted_models_until.get("ollama", 0):
+            try:
+                logger.warning("[GROQ_CLIENT -> HYBRID] Failing over to local Ollama (qwen2.5:7b)...")
+                from app.llm.ollama_client import OllamaClient
+                ollama = OllamaClient()
+                return await ollama.generate_structured(
+                    prompt=prompt,
+                    response_model=response_model,
+                    system_prompt=system_prompt,
+                    temperature=temperature
+                )
+            except Exception as ollama_err:
+                logger.error(f"[GROQ_CLIENT -> HYBRID] Local Ollama fallback failed: {ollama_err}")
+                GroqClient._exhausted_models_until["ollama"] = now + 600.0
+                raise last_exception or ollama_err
+
+        raise last_exception or RuntimeError("All LLM providers exhausted for current request window.")
 
     async def embed(self, text: str, input_type: str = "search_query") -> List[float]:
         """Generate text embedding using Cohere API if configured, otherwise local sentence-transformers with fallback."""
